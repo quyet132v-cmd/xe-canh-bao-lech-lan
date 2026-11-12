@@ -1,0 +1,784 @@
+/*
+  TEST VACH DEN BANG COI + DIEU KHIEN XE QUA WEB
+  Hai thanh PWM doc lap: tien/lui va quay trai/phai, mac dinh 150/255.
+  ESP32 DevKit WROOM-32. IR: trai truoc32, trai sau33,
+  phai truoc34, phai sau35. DO phai tuong thich 3.3V.
+  Tin hieu dieu khien coi chu dong: GPIO27 HIGH = keu, LOW = tat.
+  Ban thu nghiem lich su 10 doan cho TUNG cam bien; doc lien tuc, khong phu thuoc nut TIEN.
+  Mau ngat quang 01100110... duoc xem la net dut; net dut uu tien tat coi.
+  Neu chua phat hien net dut, chi can mot cam bien xac nhan vach lien thi coi keu.
+  Chua xac dinh: coi tat. Net dut: coi tat. Net lien + cham vach: coi keu.
+  Can cam bien di DOC vach; can ngang 1 lan khong du de phan loai.
+  Ngưong thoi gian chi la gia tri thu, phai chinh theo duong va toc do.
+  Lenh TIEN khong chung minh xe dang chay (chua co encoder).
+  Mac dinh den=HIGH. Doi tung mat tren web neu cam bien nguoc muc.
+  Thiet lap muc vach luu RAM, reset se ve mac dinh.
+  WiFi XE_ESP32 / 12345678. Web http://192.168.4.1
+  ENA25 IN1=18 IN2=19 IN3=21 IN4=22 ENB26.
+  Thao jumper ENA/ENB; dung xe khi nha nut/mat lenh 600ms.
+*/
+#include <WiFi.h>
+#include <WebServer.h>
+
+// ===== CHAN L298N =====
+const int ENA = 25;
+const int IN1 = 18;
+const int IN2 = 19;
+
+const int ENB = 26;
+const int IN3 = 21;
+const int IN4 = 22;
+
+// Doi thanh true neu ca nhom banh cung ben quay nguoc.
+// Neu chi mot banh quay nguoc, dao day rieng dong co do.
+const bool DAO_TRAI = false;
+const bool DAO_PHAI = false;
+
+// ===== WIFI =====
+const char* WIFI_NAME = "XE_ESP32";
+const char* WIFI_PASSWORD = "12345678";
+
+WebServer server(80);
+
+const unsigned long MAT_LENH_MS = 600;
+unsigned long lanNhanLenh = 0;
+
+uint64_t soThuTuCuoi = 0;
+char lenhHienTai = 'S';
+
+
+// ===== CAM BIEN VA COI =====
+const int CHAN_IR[4] = {32, 33, 34, 35};
+const int CHAN_COI = 27;
+const uint32_t LOC_NHIEU_MS = 5;
+int mucVach[4] = {HIGH, HIGH, HIGH, HIGH};
+int rawIR[4];
+int stableIR[4];
+uint32_t rawSince[4];
+bool coiKeu = false;
+int pwmHienTai = 0;
+
+bool thayVach(int i) {
+  return stableIR[i] == mucVach[i];
+}
+
+// ===== NGUONG THU NGHIEM (ms), KHONG PHAI TIEU CHUAN DUONG BO =====
+const uint32_t DOAN_MIN_MS = 40;     // Bo chuoi doi muc qua nhanh
+const uint32_t NET_DUT_MAX_MS = 600;
+const uint32_t KHOANG_TRANG_MAX_MS = 600;
+const uint32_t XAC_NHAN_LIEN_MS = 800; // Phai lon hon NET_DUT_MAX_MS
+const uint32_t MAT_VACH_MS = 900;
+const uint32_t GIU_KET_QUA_MS = 2000; // Thoi gian hieu luc ket qua neu khong duoc xac nhan lai
+const uint32_t MAT_MAU_MS = 50;      // Khong suy dien qua khoang doc bi tre
+const int SO_DOAN = 10;
+const int SO_DOAN_XAC_NHAN = 6;      // 3 doan den + 3 doan trang
+// Arduino tu sinh prototype: dung tham so int, khong dung struct o chu ky ham.
+enum LoaiVach { CHUA_RO, NET_DUT, NET_LIEN };
+struct LichSuVach {
+  bool muc[SO_DOAN];
+  uint32_t doDai[SO_DOAN];
+  int soDoan = 0;
+  bool dangHoc = false;
+  bool mucCu = false;
+  bool boDoanDau = true; // Khong tinh doan bi cat ngang khi bat dau
+  uint32_t batDau = 0;
+  LoaiVach loai = CHUA_RO;
+  uint32_t xacNhanLuc = 0;
+};
+LichSuVach lichSu[4];
+uint32_t lanDocLichSu = 0;
+
+void xoaLichSu(bool xoaKetQua) {
+  for (int i=0; i<4; i++) {
+    lichSu[i].soDoan = 0;
+    lichSu[i].dangHoc = false;
+    if (xoaKetQua) lichSu[i].loai = CHUA_RO;
+  }
+}
+
+// Nhan mau 01100110... theo cac doan 0/1 luan phien.
+// Dung do dai doan thay vi lay mau dung mot tan so co dinh de xe chay
+// nhanh/cham mot chut van nhan duoc mau net dut.
+bool laMauNetDut01100110(int i) {
+  const auto &h = lichSu[i];
+  if (h.soDoan < SO_DOAN_XAC_NHAN) return false;
+  uint32_t nho[2] = {0xFFFFFFFFu, 0xFFFFFFFFu};
+  uint32_t lon[2] = {0, 0};
+  uint32_t tong[2] = {0, 0};
+  int dem[2] = {0, 0};
+  for (int k=h.soDoan-SO_DOAN_XAC_NHAN; k<h.soDoan; k++) {
+    int m = h.muc[k] ? 1 : 0;
+    uint32_t d = h.doDai[k];
+    if (d < DOAN_MIN_MS || d > (m ? NET_DUT_MAX_MS : KHOANG_TRANG_MAX_MS)) return false;
+    if (k > h.soDoan-SO_DOAN_XAC_NHAN && h.muc[k] == h.muc[k-1]) return false;
+    if (d < nho[m]) nho[m] = d;
+    if (d > lon[m]) lon[m] = d;
+    tong[m] += d;
+    dem[m]++;
+  }
+  // Mau 01100110 co cac cum 0 va 1 gan bang nhau. Cho phep sai so
+  // toi da 2 lan de bu cho toc do xe va sai so cua cam bien.
+  uint32_t tb0 = tong[0] / dem[0];
+  uint32_t tb1 = tong[1] / dem[1];
+  bool cacDoanOnDinh = lon[0] <= 2*nho[0] && lon[1] <= 2*nho[1];
+  bool haiMucCanBang = tb0 <= 2*tb1 && tb1 <= 2*tb0;
+  return cacDoanOnDinh && haiMucCanBang;
+}
+
+void capNhatLichSu() {
+  uint32_t now = millis();
+  bool biTre = now - lanDocLichSu > MAT_MAU_MS;
+  lanDocLichSu = now;
+  for (int i=0; i<4; i++) {
+    auto &h = lichSu[i];
+    bool vach = thayVach(i);
+    if (h.loai != CHUA_RO && now-h.xacNhanLuc >= GIU_KET_QUA_MS) h.loai = CHUA_RO;
+    if (biTre) {
+      h.dangHoc = false;
+      h.soDoan = 0;
+      continue;
+    }
+    if (!h.dangHoc) {
+      h.dangHoc = true; h.mucCu = vach; h.batDau = now;
+      h.boDoanDau = true;
+    }
+    if (vach != h.mucCu) {
+      uint32_t d = now - h.batDau;
+      if (h.boDoanDau) h.boDoanDau = false;
+      else {
+        if (h.soDoan == SO_DOAN) {
+          for (int k=1; k<SO_DOAN; k++) {
+            h.muc[k-1] = h.muc[k]; h.doDai[k-1] = h.doDai[k];
+          }
+          h.soDoan--;
+        }
+        h.muc[h.soDoan] = h.mucCu;
+        h.doDai[h.soDoan++] = d;
+        if (laMauNetDut01100110(i)) {
+          h.loai = NET_DUT;
+          h.xacNhanLuc = now;
+        }
+        else if (h.loai == NET_DUT) h.loai = CHUA_RO;
+      }
+      h.mucCu = vach; h.batDau = now;
+    }
+    uint32_t d = now-h.batDau;
+    if (vach && d >= XAC_NHAN_LIEN_MS) {
+      h.loai = NET_LIEN; h.xacNhanLuc = now; h.soDoan = 0;
+    } else if (!vach && d >= MAT_VACH_MS) {
+      h.loai = CHUA_RO; h.soDoan = 0;
+    }
+  }
+}
+
+void capNhatCoi() {
+  // Moi ben gom 2 cam bien: trai (32,33), phai (34,35).
+  // Neu mot trong hai cam bien cua ben do da nhan dien NET_DUT,
+  // uu tien NET_DUT va khong cho coi keu o ben do.
+  bool traiNetDut =
+      (lichSu[0].loai == NET_DUT) || (lichSu[1].loai == NET_DUT);
+  bool phaiNetDut =
+      (lichSu[2].loai == NET_DUT) || (lichSu[3].loai == NET_DUT);
+
+  // Chi can MOT trong bon cam bien xac nhan vach lien thi coi keu.
+  // Phai cho tin hieu lien tuc du XAC_NHAN_LIEN_MS de xung 1 dau tien
+  // cua net dut khong lam coi keu nham.
+  bool coCamBienNetLien =
+      (thayVach(0) && lichSu[0].loai == NET_LIEN) ||
+      (thayVach(1) && lichSu[1].loai == NET_LIEN) ||
+      (thayVach(2) && lichSu[2].loai == NET_LIEN) ||
+      (thayVach(3) && lichSu[3].loai == NET_LIEN);
+  bool coCapNetDut = traiNetDut || phaiNetDut;
+  coiKeu = !coCapNetDut && coCamBienNetLien;
+
+  digitalWrite(CHAN_COI, coiKeu ? HIGH : LOW); // HIGH keu, LOW tat
+}
+
+void khoiTaoCamBien() {
+  for (int i = 0; i < 4; i++) {
+    pinMode(CHAN_IR[i], INPUT);
+    rawIR[i] = digitalRead(CHAN_IR[i]);
+    stableIR[i] = rawIR[i];
+    rawSince[i] = millis();
+  }
+  digitalWrite(CHAN_COI, LOW); // Tat coi truoc khi chuyen sang OUTPUT
+  pinMode(CHAN_COI, OUTPUT);
+  capNhatCoi();
+}
+
+void docCamBien() {
+  uint32_t now = millis();
+  for (int i = 0; i < 4; i++) {
+    int value = digitalRead(CHAN_IR[i]);
+    if (value != rawIR[i]) {
+      rawIR[i] = value;
+      rawSince[i] = now;
+    }
+    if (now - rawSince[i] >= LOC_NHIEU_MS) {
+      stableIR[i] = rawIR[i];
+    }
+  }
+}
+
+void guiTrangThai() {
+  String json = "{\"raw\":[";
+  for (int i = 0; i < 4; i++) {
+    if (i) json += ",";
+    json += String(stableIR[i]);
+  }
+  json += "],\"line\":[";
+  for (int i = 0; i < 4; i++) {
+    if (i) json += ",";
+    json += String(thayVach(i) ? 1 : 0);
+  }
+  json += "],\"level\":[";
+  for (int i = 0; i < 4; i++) {
+    if (i) json += ",";
+    json += String(mucVach[i]);
+  }
+  json += "],\"type\":[";
+  for (int i=0; i<4; i++) {
+    if (i) json += ",";
+    json += String((int)lichSu[i].loai);
+  }
+  json += "],\"history\":[";
+  for (int i=0; i<4; i++) {
+    if (i) json += ",";
+    json += "[";
+    for (int k=0; k<lichSu[i].soDoan; k++) {
+      if (k) json += ",";
+      json += "[" + String(lichSu[i].muc[k] ? 1 : 0) + "," + String(lichSu[i].doDai[k]) + "]";
+    }
+    json += "]";
+  }
+  json += "],\"buzzer\":" + String(coiKeu ? 1 : 0);
+  json += ",\"pwm\":" + String(pwmHienTai);
+  json += ",\"command\":\"" + String(lenhHienTai) + "\"}";
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", json);
+}
+
+void luuThietLap() {
+  if (lenhHienTai != 'S') {
+    server.send(409, "text/plain", "Hay dung xe truoc");
+    return;
+  }
+  int levels[4];
+  for (int i = 0; i < 4; i++) {
+    String key = "l" + String(i);
+    if (!server.hasArg(key) ||
+        (server.arg(key) != "0" && server.arg(key) != "1")) {
+      server.send(400, "text/plain", "Muc vach khong hop le");
+      return;
+    }
+    levels[i] = server.arg(key).toInt();
+  }
+  for (int i = 0; i < 4; i++) mucVach[i] = levels[i];
+  xoaLichSu(true);
+  capNhatCoi();
+  server.send(200, "text/plain", "Da ap dung. Thiet lap mat khi reset board.");
+}
+
+// ===== GIAO DIEN WEB =====
+const char TRANG_WEB[] PROGMEM = R"HTML(
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport"
+      content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Điều khiển xe ESP32</title>
+<style>
+  body {
+    font-family: Arial, sans-serif;
+    background: #eef2f6;
+    color: #182535;
+    text-align: center;
+    margin: 0;
+    padding: 22px 14px;
+  }
+  .panel {
+    max-width: 390px;
+    margin: auto;
+    background: white;
+    border-radius: 18px;
+    padding: 22px 16px;
+  }
+  h2 { margin-top: 0; }
+  .controls {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 10px;
+    margin: 24px 0;
+  }
+  button {
+    border: 0;
+    border-radius: 12px;
+    min-height: 76px;
+    background: #1769d2;
+    color: white;
+    font-size: 18px;
+    font-weight: bold;
+    touch-action: none;
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-touch-callout: none;
+  }
+  button:active { background: #104a94; }
+  #stop { background: #c83232; }
+  input[type=range] { width: 100%; margin: 18px 0; }
+  select { padding: 8px; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { padding: 8px 3px; border-bottom: 1px solid #ddd; }
+  details { text-align: left; margin-top: 18px; }
+  details p { line-height: 1.5; }
+  .small { min-height: 44px; font-size: 15px; padding: 10px; margin: 8px 0; }
+  #alarm { color: #b42318; font-weight: bold; }
+
+  #status { min-height: 24px; }
+</style>
+</head>
+<body>
+<div class="panel">
+  <h2>Test nét đứt / nét liền</h2>
+  <p>Giữ nút để chạy, nhả để dừng</p>
+
+  <label for="driveSpeed">
+    PWM tiến / lùi: <strong id="driveValue">150</strong> / 255
+  </label>
+  <input id="driveSpeed" type="range"
+         min="0" max="255" value="150">
+
+  <label for="turnSpeed">
+    PWM quay trái / phải: <strong id="turnValue">150</strong> / 255
+  </label>
+  <input id="turnSpeed" type="range"
+         min="0" max="255" value="150">
+
+  <div class="controls">
+    <span></span>
+    <button data-command="F">TIẾN</button>
+    <span></span>
+
+    <button data-command="L">TRÁI</button>
+    <button id="stop">DỪNG</button>
+    <button data-command="R">PHẢI</button>
+
+    <span></span>
+    <button data-command="B">LÙI</button>
+    <span></span>
+  </div>
+
+  <p id="status">Đang kết nối...</p>
+  <p id="actual"></p>
+  <p id="alarm"></p>
+  <table>
+    <thead><tr><th>Mắt đọc</th><th>DO</th><th>Đang thấy / loại vạch</th></tr></thead>
+    <tbody>
+      <tr><td>Trái trước · 32</td><td id="raw0">—</td><td id="line0">—</td></tr>
+      <tr><td>Trái sau · 33</td><td id="raw1">—</td><td id="line1">—</td></tr>
+      <tr><td>Phải trước · 34</td><td id="raw2">—</td><td id="line2">—</td></tr>
+      <tr><td>Phải sau · 35</td><td id="raw3">—</td><td id="line3">—</td></tr>
+    </tbody>
+  </table>
+  <details>
+    <summary>Hiệu chỉnh cảm biến</summary>
+    <p>Đưa từng mắt qua nền trắng và vạch đen. Chọn DO ứng với vạch đen.</p>
+    <p>Trái trước <select id="level0"><option value="1">Đen = 1</option><option value="0">Đen = 0</option></select></p>
+    <p>Trái sau <select id="level1"><option value="1">Đen = 1</option><option value="0">Đen = 0</option></select></p>
+    <p>Phải trước <select id="level2"><option value="1">Đen = 1</option><option value="0">Đen = 0</option></select></p>
+    <p>Phải sau <select id="level3"><option value="1">Đen = 1</option><option value="0">Đen = 0</option></select></p>
+    <p>Thiết lập mất khi reset board.</p>
+    <button class="small" id="apply">Áp dụng khi xe dừng</button>
+    <p id="settingsStatus"></p>
+  </details>
+  <p style="font-size:13px;line-height:1.5">
+    Cảm biến đọc liên tục, không cần giữ TIẾN. Chuỗi ngắt quãng kiểu 01100110... được nhận là nét đứt và còi tắt.
+    Nếu chưa nhận là nét đứt, chỉ cần một trong bốn cảm biến xác nhận vạch liên tục 800 ms thì còi kêu.
+    Dừng / quay / lùi: vẫn đọc cảm biến và cập nhật còi.
+    Đổi PWM tiến: xóa lịch sử để học lại. Đứng yên trên một đoạn nét đứt có thể bị nhận là nét liền sau 800 ms.
+  </p>
+  <details><summary>Lịch sử từng mắt (1=vạch, 0=nền; ms)</summary>
+    <pre id="history" style="white-space:pre-wrap;text-align:left"></pre>
+  </details>
+  <p>Ngưỡng thử: mỗi đoạn 40–600 ms; cần 3 cặp vạch/nền.
+  </p>
+</div>
+
+<script>
+const driveSpeed = document.getElementById('driveSpeed');
+const driveValue = document.getElementById('driveValue');
+const turnSpeed = document.getElementById('turnSpeed');
+const turnValue = document.getElementById('turnValue');
+const statusText = document.getElementById('status');
+
+const names = {
+  F: 'Tiến',
+  B: 'Lùi',
+  L: 'Rẽ trái',
+  R: 'Rẽ phải',
+  S: 'Dừng'
+};
+
+let command = 'S';
+let activePointer = null;
+let sequence = Date.now();
+let ready = false;
+let settingsLoaded = false;
+
+function speedForCommand(direction) {
+  if (direction === 'F' || direction === 'B') return driveSpeed.value;
+  if (direction === 'L' || direction === 'R') return turnSpeed.value;
+  return 0;
+}
+
+async function sendCommand() {
+  const currentCommand = command;
+  const currentSequence = ++sequence;
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 450);
+
+  try {
+    const response = await fetch(
+      '/control?cmd=' + currentCommand +
+      '&speed=' + speedForCommand(currentCommand) +
+      '&seq=' + currentSequence,
+      {
+        cache: 'no-store',
+        signal: controller.signal
+      }
+    );
+
+    if (!response.ok) {
+      throw new Error('Loi ket noi');
+    }
+
+    if (currentSequence === sequence) {
+      statusText.textContent =
+        'Đã gửi lệnh: ' + names[currentCommand];
+    }
+  } catch (error) {
+    {
+      command = 'S';
+      activePointer = null;
+      statusText.textContent =
+        'Mất phản hồi. Xe sẽ tự dừng khi hết thời gian chờ.';
+    }
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function stopCar() {
+  command = 'S';
+  activePointer = null;
+  return sendCommand();
+}
+
+document.querySelectorAll('[data-command]').forEach(button => {
+  button.addEventListener('pointerdown', event => {
+    event.preventDefault();
+
+    if (!ready || activePointer !== null) return;
+
+    activePointer = event.pointerId;
+    button.setPointerCapture(event.pointerId);
+    command = button.dataset.command;
+    sendCommand();
+  });
+
+  button.addEventListener('pointerup', event => {
+    if (event.pointerId === activePointer) stopCar();
+  });
+
+  button.addEventListener('pointercancel', event => {
+    if (event.pointerId === activePointer) stopCar();
+  });
+
+  button.addEventListener('lostpointercapture', event => {
+    if (event.pointerId === activePointer) stopCar();
+  });
+});
+
+document.getElementById('stop')
+  .addEventListener('pointerdown', event => {
+    event.preventDefault();
+    stopCar();
+  });
+
+driveSpeed.addEventListener('input', () => {
+  driveValue.textContent = driveSpeed.value;
+  if (command === 'F' || command === 'B') sendCommand();
+});
+
+turnSpeed.addEventListener('input', () => {
+  turnValue.textContent = turnSpeed.value;
+  if (command === 'L' || command === 'R') sendCommand();
+});
+
+window.addEventListener('blur', stopCar);
+window.addEventListener('pagehide', stopCar);
+
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) stopCar();
+});
+
+document.addEventListener('contextmenu', event => {
+  event.preventDefault();
+});
+
+// Gui lai lenh trong khi giu nut.
+setInterval(() => {
+  if (command !== 'S') sendCommand();
+}, 150);
+
+async function postAction(path, body = '') {
+  await stopCar();
+  const response = await fetch(path, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+    body,
+    signal: AbortSignal.timeout(1800)
+  });
+  const message = await response.text();
+  document.getElementById('settingsStatus').textContent = message;
+  if (!response.ok) throw new Error(message);
+}
+
+function showError(error) {
+  document.getElementById('settingsStatus').textContent = error.message;
+}
+
+document.getElementById('apply').onclick = async () => {
+  const data = new URLSearchParams();
+  for (let i = 0; i < 4; i++) {
+    data.set('l' + i, document.getElementById('level' + i).value);
+  }
+  try { await postAction('/settings', data.toString()); }
+  catch (error) { showError(error); }
+};
+
+async function pollStatus() {
+  try {
+    const response = await fetch('/status', {
+      cache: 'no-store', signal: AbortSignal.timeout(1200)
+    });
+    if (!response.ok) throw new Error('Không đọc được cảm biến');
+    const data = await response.json();
+    ready = true;
+    for (let i = 0; i < 4; i++) {
+      document.getElementById('raw' + i).textContent = data.raw[i];
+      document.getElementById('line' + i).textContent = (data.line[i] ? 'Vạch đen' : 'Nền') + ' · ' + ['Chưa rõ', 'Nét đứt', 'Nét liền'][data.type[i]];
+    }
+    document.getElementById('history').textContent = data.history.map((h,i) => 'Mắt ' + (i+1) + ': ' + h.map(d => d[0] + ':' + d[1]).join(' | ')).join('\n');
+    document.getElementById('actual').textContent =
+      'ESP32: ' + names[data.command] + ' · PWM ' + data.pwm;
+    document.getElementById('alarm').textContent = data.buzzer
+      ? 'CÒI KÊU · Có ít nhất một cảm biến xác nhận nét liền'
+      : 'CÒI TẮT · Đang phân loại / nét đứt / không thấy vạch';
+    if (!settingsLoaded) {
+      for (let i = 0; i < 4; i++) {
+        document.getElementById('level' + i).value = data.level[i];
+      }
+      settingsLoaded = true;
+    }
+  } catch (error) {
+    ready = false;
+    command = 'S';
+    activePointer = null;
+    statusText.textContent = 'Mất kết nối. Nhấn lại nút sau khi kết nối phục hồi.';
+    document.getElementById('alarm').textContent = 'Dữ liệu cảm biến đã cũ';
+  } finally {
+    setTimeout(pollStatus, 400);
+  }
+}
+
+sendCommand();
+pollStatus();
+</script>
+</body>
+</html>
+)HTML";
+
+// ===== DIEU KHIEN DONG CO =====
+void dungXe() {
+  analogWrite(ENA, 0);
+  analogWrite(ENB, 0);
+
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, LOW);
+}
+
+void dieuKhienBen(int en, int inA, int inB, int tocDo) {
+  digitalWrite(inA, tocDo > 0 ? HIGH : LOW);
+  digitalWrite(inB, tocDo < 0 ? HIGH : LOW);
+  analogWrite(en, abs(tocDo));
+}
+
+void chayXe(char lenh, int tocDo) {
+  // Doi lenh khong xoa lich su: cam bien va coi hoat dong doc lap.
+  if (lenh == 'F' && lenhHienTai == 'F' && tocDo != pwmHienTai) xoaLichSu(true);
+  if (tocDo == 0 || lenh == 'S') {
+    dungXe();
+    lenhHienTai = 'S';
+    pwmHienTai = 0;
+    return;
+  }
+  pwmHienTai = tocDo;
+  // Dung ngan truoc khi doi huong.
+  if (lenh != lenhHienTai) {
+    dungXe();
+    delay(80);
+  }
+
+  int trai = 0;
+  int phai = 0;
+
+  switch (lenh) {
+    case 'F':
+      trai = tocDo;
+      phai = tocDo;
+      break;
+
+    case 'B':
+      trai = -tocDo;
+      phai = -tocDo;
+      break;
+
+    case 'L':
+      // Theo dau noi dong co thuc te: lenh nay lam xe quay trai.
+      trai = tocDo;
+      phai = 0;
+      break;
+
+    case 'R':
+      // Theo dau noi dong co thuc te: lenh nay lam xe quay phai.
+      trai = 0;
+      phai = tocDo;
+      break;
+
+    default:
+      dungXe();
+      lenhHienTai = 'S';
+      return;
+  }
+
+  if (DAO_TRAI) trai = -trai;
+  if (DAO_PHAI) phai = -phai;
+
+  dieuKhienBen(ENA, IN1, IN2, trai);
+  dieuKhienBen(ENB, IN3, IN4, phai);
+
+  lenhHienTai = lenh;
+}
+
+// ===== XU LY LENH WEB =====
+void nhanLenh() {
+  if (!server.hasArg("cmd") ||
+      !server.hasArg("speed") ||
+      !server.hasArg("seq")) {
+    server.send(400, "text/plain", "Thieu tham so");
+    return;
+  }
+
+  String chuoiLenh = server.arg("cmd");
+
+  if (chuoiLenh.length() != 1) {
+    server.send(400, "text/plain", "Lenh khong hop le");
+    return;
+  }
+
+  char lenh = chuoiLenh[0];
+
+  if (lenh != 'F' && lenh != 'B' &&
+      lenh != 'L' && lenh != 'R' && lenh != 'S') {
+    server.send(400, "text/plain", "Lenh khong hop le");
+    return;
+  }
+
+  uint64_t soThuTu =
+      strtoull(server.arg("seq").c_str(), nullptr, 10);
+
+  // Bo qua lenh cu den tre, tranh chay lai sau lenh dung.
+  if (soThuTu <= soThuTuCuoi) {
+    server.send(200, "text/plain", "Bo qua lenh cu");
+    return;
+  }
+
+  soThuTuCuoi = soThuTu;
+
+  int tocDo = constrain(server.arg("speed").toInt(), 0, 255);
+
+  chayXe(lenh, tocDo);
+  lanNhanLenh = millis();
+
+  server.send(200, "text/plain", "OK");
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(ENA, OUTPUT);
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+
+  pinMode(ENB, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+
+  dungXe();
+  khoiTaoCamBien();
+
+  // ===== CHI CAU HINH LAI PHAN PHAT WIFI AP =====
+  WiFi.softAPdisconnect(true);
+  delay(500);
+
+  WiFi.mode(WIFI_AP);
+  WiFi.setSleep(false);
+
+  // Co dinh dia chi truy cap cua xe
+  IPAddress localIP(192, 168, 4, 1);
+  IPAddress gateway(192, 168, 4, 1);
+  IPAddress subnet(255, 255, 255, 0);
+  WiFi.softAPConfig(localIP, gateway, subnet);
+
+  // Kenh 6, hien SSID, cho toi da 4 thiet bi
+  if (!WiFi.softAP(WIFI_NAME, WIFI_PASSWORD, 6, false, 4)) {
+    Serial.println("Khoi tao WiFi that bai");
+    return;
+  }
+
+  delay(300);
+
+  server.on("/", HTTP_GET, []() {
+    server.sendHeader("Cache-Control", "no-store");
+    server.send_P(200, "text/html; charset=utf-8", TRANG_WEB);
+  });
+
+  server.on("/control", HTTP_GET, nhanLenh);
+  server.on("/status", HTTP_GET, guiTrangThai);
+  server.on("/settings", HTTP_POST, luuThietLap);
+  server.begin();
+
+  Serial.println("WiFi: XE_ESP32");
+  Serial.println("Mat khau: 12345678");
+  Serial.print("Dia chi web: http://");
+  Serial.println(WiFi.softAPIP());
+}
+
+void loop() {
+  if (lenhHienTai != 'S' &&
+      millis() - lanNhanLenh > MAT_LENH_MS) {
+    dungXe();
+    lenhHienTai = 'S';
+    pwmHienTai = 0;
+  }
+
+  server.handleClient();
+  docCamBien();
+  capNhatLichSu();
+  capNhatCoi();
+}
